@@ -1,0 +1,4 @@
+customtkinter>=5.2.0
+TikTokLive>=6.0.0
+edge-tts>=6.1.0
+pygame>=2.5.0

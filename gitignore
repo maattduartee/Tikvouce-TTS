@@ -1,0 +1,24 @@
+# Ambientes virtuais
+.venv/
+venv/
+env/
+
+# Cache do Python
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Arquivos de áudio temporários gerados em tempo de execução
+*.mp3
+*.wav
+
+# Configurações de IDE
+.vscode/
+.idea/
+
+# Sistema operacional
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
