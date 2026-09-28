@@ -1,3 +1,11 @@
+# Configurações pessoais salvas pelo app (usuário, voz, volume etc.)
+config.json
+
+# Artefatos gerados pelo PyInstaller (build_exe.bat)
+build/
+dist/
+*.spec
+
 # Ambientes virtuais
 .venv/
 venv/

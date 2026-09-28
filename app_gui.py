@@ -4,7 +4,7 @@ app_gui.py
 Interface gráfica (CustomTkinter) para o bot de Text-to-Speech de lives do TikTok.
 
 Dependências:
-    pip install customtkinter TikTokLive edge-tts pygame
+    pip install customtkinter TikTokLive edge-tts pygame Pillow
 
 Arquitetura:
     - A GUI roda no thread principal (mainloop do Tkinter).
@@ -13,12 +13,19 @@ Arquitetura:
     - A comunicação Thread -> GUI é feita via queue.Queue (thread-safe), lida
       periodicamente pelo mainloop através de `self.after(...)`.
     - Comandos GUI -> Thread (como "parar") usam asyncio.run_coroutine_threadsafe.
-    - A tela inicial mostra só o essencial (usuário, botão play e status); tema,
-      voz, prévia de voz e volume ficam numa janela de Configurações separada.
+    - A tela inicial mostra o essencial (foto/nome de quem está ao vivo, status,
+      usuário e botão play); tema, voz, idioma, volume e demais opções ficam na
+      janela de Configurações, com botões OK (salva) / Cancelar (descarta).
+    - Configurações são persistidas em config.json ao lado do executável/script.
+    - Em caso de queda de conexão não solicitada pelo usuário, o app tenta
+      reconectar automaticamente algumas vezes, com espera crescente.
 """
 
 import os
+import io
 import sys
+import json
+import time
 import uuid
 import queue
 import asyncio
@@ -27,6 +34,7 @@ import traceback
 import threading
 import tempfile
 import datetime
+import collections
 
 import customtkinter as ctk
 
@@ -35,6 +43,18 @@ import pygame
 
 from TikTokLive import TikTokLiveClient
 from TikTokLive.events import ConnectEvent, DisconnectEvent, CommentEvent
+
+# Eventos de presente e novo seguidor (nem toda versão da lib expõe os dois
+# com o mesmo nome, então importamos com fallback seguro).
+try:
+    from TikTokLive.events import GiftEvent
+except ImportError:
+    GiftEvent = None
+
+try:
+    from TikTokLive.events import FollowEvent
+except ImportError:
+    FollowEvent = None
 
 # Exceções específicas do TikTokLive (nem todas as versões da lib expõem as
 # mesmas classes, então importamos com fallback seguro para não quebrar o app).
@@ -61,28 +81,157 @@ ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
 
 APP_NAME = "TikVoice"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.2.0"
 
-VOICES = {
-    "Antônio (Masculino - pt-BR-AntonioNeural)": "pt-BR-AntonioNeural",
-    "Francisca (Feminino - pt-BR-FranciscaNeural)": "pt-BR-FranciscaNeural",
-    "Thalita (Feminino - pt-BR-ThalitaNeural)": "pt-BR-ThalitaNeural",
+# Idiomas e vozes disponíveis (nome amigável -> id da voz neural do edge-tts)
+LANGUAGES: dict[str, dict[str, str]] = {
+    "Português (Brasil)": {
+        "Antônio (Masculino)": "pt-BR-AntonioNeural",
+        "Francisca (Feminino)": "pt-BR-FranciscaNeural",
+        "Thalita (Feminino)": "pt-BR-ThalitaNeural",
+        "Brenda (Feminino)": "pt-BR-BrendaNeural",
+        "Donato (Masculino)": "pt-BR-DonatoNeural",
+        "Elza (Feminino)": "pt-BR-ElzaNeural",
+        "Fábio (Masculino)": "pt-BR-FabioNeural",
+        "Giovanna (Feminino)": "pt-BR-GiovannaNeural",
+        "Humberto (Masculino)": "pt-BR-HumbertoNeural",
+        "Júlio (Masculino)": "pt-BR-JulioNeural",
+        "Leila (Feminino)": "pt-BR-LeilaNeural",
+        "Letícia (Feminino)": "pt-BR-LeticiaNeural",
+        "Manuela (Feminino)": "pt-BR-ManuelaNeural",
+        "Nicolau (Masculino)": "pt-BR-NicolauNeural",
+        "Valério (Masculino)": "pt-BR-ValerioNeural",
+        "Yara (Feminino)": "pt-BR-YaraNeural",
+    },
+    "Português (Portugal)": {
+        "Duarte (Masculino)": "pt-PT-DuarteNeural",
+        "Raquel (Feminino)": "pt-PT-RaquelNeural",
+    },
+    "Inglês (EUA)": {
+        "Guy (Masculino)": "en-US-GuyNeural",
+        "Christopher (Masculino)": "en-US-ChristopherNeural",
+        "Aria (Feminino)": "en-US-AriaNeural",
+        "Jenny (Feminino)": "en-US-JennyNeural",
+    },
+    "Inglês (Reino Unido)": {
+        "Ryan (Masculino)": "en-GB-RyanNeural",
+        "Sonia (Feminino)": "en-GB-SoniaNeural",
+    },
+    "Espanhol (Espanha)": {
+        "Álvaro (Masculino)": "es-ES-AlvaroNeural",
+        "Elvira (Feminino)": "es-ES-ElviraNeural",
+    },
+    "Espanhol (México)": {
+        "Jorge (Masculino)": "es-MX-JorgeNeural",
+        "Dalia (Feminino)": "es-MX-DaliaNeural",
+    },
+    "Francês (França)": {
+        "Henri (Masculino)": "fr-FR-HenriNeural",
+        "Denise (Feminino)": "fr-FR-DeniseNeural",
+    },
+    "Italiano": {
+        "Diego (Masculino)": "it-IT-DiegoNeural",
+        "Elsa (Feminino)": "it-IT-ElsaNeural",
+    },
+    "Japonês": {
+        "Keita (Masculino)": "ja-JP-KeitaNeural",
+        "Nanami (Feminino)": "ja-JP-NanamiNeural",
+    },
 }
 
-PREVIEW_TEXT = "Olá! Esta é uma prévia da voz selecionada para o seu chat da live."
+DEFAULT_LANGUAGE = "Português (Brasil)"
+DEFAULT_VOICE = "Antônio (Masculino)"
 
-# Tamanhos da janela principal com o log visível / oculto
-WINDOW_SIZE = "550x680"
+# Textos de prévia de voz, por idioma (cai para o português se não achar)
+PREVIEW_TEXTS = {
+    "Português (Brasil)": "Olá! Esta é uma prévia da voz selecionada para o seu chat da live.",
+    "Português (Portugal)": "Olá! Esta é uma amostra da voz escolhida para o chat da sua live.",
+    "Inglês (EUA)": "Hello! This is a preview of the selected voice for your live chat.",
+    "Inglês (Reino Unido)": "Hello! This is a preview of the selected voice for your live chat.",
+    "Espanhol (Espanha)": "¡Hola! Esta es una vista previa de la voz seleccionada para tu chat en vivo.",
+    "Espanhol (México)": "¡Hola! Esta es una vista previa de la voz seleccionada para tu chat en vivo.",
+    "Francês (França)": "Bonjour ! Ceci est un aperçu de la voix sélectionnée pour votre chat en direct.",
+    "Italiano": "Ciao! Questa è un'anteprima della voce selezionata per la chat dal vivo.",
+    "Japonês": "こんにちは！これはライブチャット用に選択された音声のプレビューです。",
+}
+
+# Frases faladas (comentário / presente / seguidor novo), por idioma
+PHRASES = {
+    "Português (Brasil)": {
+        "said": "{user} disse: {text}",
+        "gift": "{user} mandou um presente: {gift}!",
+        "follow": "{user} começou a seguir o canal!",
+    },
+    "Português (Portugal)": {
+        "said": "{user} disse: {text}",
+        "gift": "{user} enviou um presente: {gift}!",
+        "follow": "{user} começou a seguir o canal!",
+    },
+    "Inglês (EUA)": {
+        "said": "{user} said: {text}",
+        "gift": "{user} sent a gift: {gift}!",
+        "follow": "{user} started following the channel!",
+    },
+    "Inglês (Reino Unido)": {
+        "said": "{user} said: {text}",
+        "gift": "{user} sent a gift: {gift}!",
+        "follow": "{user} started following the channel!",
+    },
+    "Espanhol (Espanha)": {
+        "said": "{user} dijo: {text}",
+        "gift": "¡{user} envió un regalo: {gift}!",
+        "follow": "¡{user} empezó a seguir el canal!",
+    },
+    "Espanhol (México)": {
+        "said": "{user} dijo: {text}",
+        "gift": "¡{user} envió un regalo: {gift}!",
+        "follow": "¡{user} empezó a seguir el canal!",
+    },
+    "Francês (França)": {
+        "said": "{user} a dit : {text}",
+        "gift": "{user} a envoyé un cadeau : {gift} !",
+        "follow": "{user} a commencé à suivre la chaîne !",
+    },
+    "Italiano": {
+        "said": "{user} ha detto: {text}",
+        "gift": "{user} ha inviato un regalo: {gift}!",
+        "follow": "{user} ha iniziato a seguire il canale!",
+    },
+    "Japonês": {
+        "said": "{user}さんが言いました: {text}",
+        "gift": "{user}さんがギフトを送りました: {gift}！",
+        "follow": "{user}さんがチャンネルのフォローを開始しました！",
+    },
+}
+
+# Tamanho inicial da janela principal (agora redimensionável)
+WINDOW_SIZE = "550x700"
+WINDOW_MIN_SIZE = (480, 540)
+
+AVATAR_SIZE = 56
+
+# Reconexão automática
+MAX_RECONNECT_ATTEMPTS = 5
+RECONNECT_BASE_DELAY_SECONDS = 5
+
+# Anti-flood
+RECENT_MESSAGE_WINDOW_SECONDS = 8   # janela para considerar uma mensagem "repetida"
+MAX_QUEUE_SIZE = 12                 # tamanho máximo da fila de fala pendente
+
+
+def _get_base_dir() -> str:
+    """Retorna a pasta onde salvar o config.json — funciona tanto rodando
+    como script .py quanto empacotado como .exe pelo PyInstaller."""
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+CONFIG_PATH = os.path.join(_get_base_dir(), "config.json")
 
 
 class _QueueLogHandler(logging.Handler):
-    """Encaminha os logs internos de bibliotecas (ex: TikTokLive) para a GUI.
-
-    Muitos erros (ex: 'usuário offline', falhas de rede) acontecem dentro de
-    tasks internas da própria lib e nunca chegam até o nosso try/except em
-    volta de client.connect(). Capturando o logger delas, garantimos que o
-    motivo real apareça no monitor de chat.
-    """
+    """Encaminha os logs internos de bibliotecas (ex: TikTokLive) para a GUI."""
 
     def __init__(self, log_func):
         super().__init__()
@@ -97,15 +246,29 @@ class _QueueLogHandler(logging.Handler):
 
 
 # =============================================================================
-# Janela de Configurações (tema, voz, prévia de voz, volume)
+# Janela de Configurações
 # =============================================================================
 class SettingsWindow(ctk.CTkToplevel):
     def __init__(self, app: "TikTokTTSApp"):
         super().__init__(app)
         self.app = app
 
+        # Snapshot do estado atual, para poder reverter se o usuário cancelar.
+        # OBS: "appearance_mode" não entra aqui — o tema só é aplicado depois
+        # que esta janela fecha (veja _on_ok), então não há nada ao vivo para
+        # reverter nesse campo.
+        self._snapshot = {
+            "language": self.app.language_var.get(),
+            "voice": self.app.voice_var.get(),
+            "volume": self.app.volume_value,
+            "read_username_enabled": self.app.read_username_enabled,
+            "read_username_with_at": self.app.read_username_with_at,
+            "anti_flood_enabled": self.app.anti_flood_enabled,
+            "announce_events_enabled": self.app.announce_events_enabled,
+        }
+
         self.title("Configurações")
-        self.geometry("420x460")
+        self.geometry("440x660")
         self.resizable(False, False)
         self.transient(app)
         # OBS: propositalmente NÃO usamos grab_set() aqui. Uma janela modal
@@ -113,7 +276,7 @@ class SettingsWindow(ctk.CTkToplevel):
         # redesenha todas as janelas abertas) pode ficar "presa" bloqueando
         # cliques em todo o app — inclusive o botão de fechar da janela
         # principal — mesmo se ela sumir de vista.
-        self.protocol("WM_DELETE_WINDOW", self._on_settings_close)
+        self.protocol("WM_DELETE_WINDOW", self._on_cancel)
 
         pad = 16
 
@@ -121,8 +284,12 @@ class SettingsWindow(ctk.CTkToplevel):
             self, text="⚙️  Configurações", font=ctk.CTkFont(size=18, weight="bold")
         ).pack(pady=(pad, 8))
 
+        # Área rolável para caber todas as seções sem estourar a tela
+        scroll = ctk.CTkScrollableFrame(self, fg_color="transparent")
+        scroll.pack(fill="both", expand=True, padx=0, pady=0)
+
         # ---------- Aparência (dark / light) ----------
-        appearance_frame = ctk.CTkFrame(self, corner_radius=12)
+        appearance_frame = ctk.CTkFrame(scroll, corner_radius=12)
         appearance_frame.pack(fill="x", padx=pad, pady=(0, 12))
 
         ctk.CTkLabel(appearance_frame, text="Aparência:", anchor="w").pack(
@@ -133,23 +300,36 @@ class SettingsWindow(ctk.CTkToplevel):
         self.appearance_var = ctk.StringVar(
             value="Escuro" if current_mode == "Dark" else "Claro"
         )
-        appearance_switcher = ctk.CTkSegmentedButton(
+        ctk.CTkSegmentedButton(
             appearance_frame,
             values=["Escuro", "Claro"],
             variable=self.appearance_var,
             command=self._on_appearance_change,
-        )
-        appearance_switcher.pack(fill="x", padx=16, pady=(0, 16))
+        ).pack(fill="x", padx=16, pady=(0, 16))
 
-        # ---------- Voz + prévia ----------
-        voice_frame = ctk.CTkFrame(self, corner_radius=12)
+        # ---------- Idioma + Voz + prévia ----------
+        voice_frame = ctk.CTkFrame(scroll, corner_radius=12)
         voice_frame.pack(fill="x", padx=pad, pady=(0, 12))
 
-        ctk.CTkLabel(voice_frame, text="Voz:", anchor="w").pack(
+        ctk.CTkLabel(voice_frame, text="Idioma:", anchor="w").pack(
             fill="x", padx=16, pady=(14, 4)
         )
+        self.language_menu = ctk.CTkOptionMenu(
+            voice_frame,
+            values=list(LANGUAGES.keys()),
+            variable=self.app.language_var,
+            command=self._on_language_change,
+        )
+        self.language_menu.pack(fill="x", padx=16, pady=(0, 12))
+
+        ctk.CTkLabel(voice_frame, text="Voz:", anchor="w").pack(
+            fill="x", padx=16, pady=(0, 4)
+        )
         self.voice_menu = ctk.CTkOptionMenu(
-            voice_frame, values=list(VOICES.keys()), variable=self.app.voice_var
+            voice_frame,
+            values=list(LANGUAGES[self.app.language_var.get()].keys()),
+            variable=self.app.voice_var,
+            command=self._on_voice_change,
         )
         self.voice_menu.pack(fill="x", padx=16, pady=(0, 12))
 
@@ -159,7 +339,7 @@ class SettingsWindow(ctk.CTkToplevel):
         self.preview_button.pack(fill="x", padx=16, pady=(0, 16))
 
         # ---------- Volume ----------
-        volume_frame = ctk.CTkFrame(self, corner_radius=12)
+        volume_frame = ctk.CTkFrame(scroll, corner_radius=12)
         volume_frame.pack(fill="x", padx=pad, pady=(0, 12))
 
         ctk.CTkLabel(volume_frame, text="Volume:", anchor="w").pack(
@@ -184,32 +364,176 @@ class SettingsWindow(ctk.CTkToplevel):
         volume_slider.grid(row=0, column=0, sticky="ew", padx=(0, 10))
         self.volume_label.grid(row=0, column=1)
 
-        # ---------- Fechar ----------
+        # ---------- Leitura do nome de quem enviou a mensagem ----------
+        username_read_frame = ctk.CTkFrame(scroll, corner_radius=12)
+        username_read_frame.pack(fill="x", padx=pad, pady=(0, 12))
+
+        self.username_enabled_var = ctk.BooleanVar(value=self.app.read_username_enabled)
+        ctk.CTkSwitch(
+            username_read_frame,
+            text="Falar nome de quem comentou",
+            variable=self.username_enabled_var,
+            onvalue=True,
+            offvalue=False,
+            command=self._on_username_read_toggle_change,
+        ).pack(fill="x", padx=16, pady=(14, 8))
+
+        self.username_format_var = ctk.StringVar(
+            value="Com @" if self.app.read_username_with_at else "Sem @"
+        )
+        self.username_format_switcher = ctk.CTkSegmentedButton(
+            username_read_frame,
+            values=["Com @", "Sem @"],
+            variable=self.username_format_var,
+            command=self._on_username_format_change,
+            state="normal" if self.app.read_username_enabled else "disabled",
+        )
+        self.username_format_switcher.pack(fill="x", padx=16, pady=(0, 4))
+
+        ctk.CTkLabel(
+            username_read_frame,
+            text='Ex.: "@fulano disse: sua mensagem" ou "fulano disse: sua mensagem". '
+                 'Desligado, o bot lê só a mensagem, sem citar quem comentou.',
+            font=ctk.CTkFont(size=11),
+            text_color="gray50",
+            anchor="w",
+            wraplength=380,
+        ).pack(fill="x", padx=16, pady=(0, 14))
+
+        # ---------- Anti-flood ----------
+        antiflood_frame = ctk.CTkFrame(scroll, corner_radius=12)
+        antiflood_frame.pack(fill="x", padx=pad, pady=(0, 12))
+
+        self.antiflood_var = ctk.BooleanVar(value=self.app.anti_flood_enabled)
+        ctk.CTkSwitch(
+            antiflood_frame,
+            text="Filtro anti-flood (ignora repetições recentes)",
+            variable=self.antiflood_var,
+            onvalue=True,
+            offvalue=False,
+            command=self._on_antiflood_change,
+        ).pack(fill="x", padx=16, pady=(14, 4))
+
+        ctk.CTkLabel(
+            antiflood_frame,
+            text="Evita ler a mesma mensagem várias vezes e mantém a fila "
+                 "curta num chat muito ativo.",
+            font=ctk.CTkFont(size=11),
+            text_color="gray50",
+            anchor="w",
+            wraplength=380,
+        ).pack(fill="x", padx=16, pady=(0, 14))
+
+        # ---------- Presentes / seguidores ----------
+        events_frame = ctk.CTkFrame(scroll, corner_radius=12)
+        events_frame.pack(fill="x", padx=pad, pady=(0, 12))
+
+        self.events_var = ctk.BooleanVar(value=self.app.announce_events_enabled)
+        ctk.CTkSwitch(
+            events_frame,
+            text="Anunciar presentes e novos seguidores",
+            variable=self.events_var,
+            onvalue=True,
+            offvalue=False,
+            command=self._on_events_change,
+        ).pack(fill="x", padx=16, pady=(14, 4))
+
+        ctk.CTkLabel(
+            events_frame,
+            text="Aplica-se na próxima vez que clicar em Iniciar.",
+            font=ctk.CTkFont(size=11),
+            text_color="gray50",
+            anchor="w",
+        ).pack(fill="x", padx=16, pady=(0, 14))
+
+        # ---------- Versão ----------
         ctk.CTkLabel(
             self,
             text=f"{APP_NAME} v{APP_VERSION}",
             font=ctk.CTkFont(size=11),
             text_color="gray50",
-        ).pack(pady=(0, 2))
+        ).pack(pady=(4, 2))
+
+        # ---------- OK / Cancelar ----------
+        button_row = ctk.CTkFrame(self, fg_color="transparent")
+        button_row.pack(fill="x", padx=pad, pady=(4, pad))
+        button_row.grid_columnconfigure((0, 1), weight=1)
 
         ctk.CTkButton(
-            self,
-            text="Fechar",
+            button_row,
+            text="Cancelar",
             fg_color="gray30",
             hover_color="gray20",
-            command=self._on_settings_close,
-        ).pack(pady=(4, pad))
+            command=self._on_cancel,
+        ).grid(row=0, column=0, sticky="ew", padx=(0, 6))
 
-    def _on_settings_close(self):
+        ctk.CTkButton(
+            button_row,
+            text="OK",
+            fg_color="#2fa572",
+            hover_color="#248a5d",
+            command=self._on_ok,
+        ).grid(row=0, column=1, sticky="ew", padx=(6, 0))
+
+    # -- Mudanças ao vivo (prévia imediata, só persistem se clicar OK) -------
+    def _on_appearance_change(self, value):
+        # Propositalmente NÃO chamamos ctk.set_appearance_mode() aqui.
+        # Trocar o tema enquanto esta janela ainda está aberta é o que
+        # causava o bug de a própria janela de Configurações fechar sozinha
+        # (o redesenho global do CustomTkinter mexe em todas as janelas
+        # abertas, incluindo esta). O tema só é aplicado de fato em _on_ok,
+        # já depois desta janela ter sido destruída.
+        pass
+
+    def _on_language_change(self, value):
+        voices_for_lang = list(LANGUAGES.get(value, {}).keys())
+        self.voice_menu.configure(values=voices_for_lang)
+        if voices_for_lang:
+            self.app.voice_var.set(voices_for_lang[0])
+
+    def _on_voice_change(self, value):
+        pass  # voice_var já foi atualizado pela própria variable=
+
+    def _on_username_read_toggle_change(self):
+        enabled = self.username_enabled_var.get()
+        self.app.read_username_enabled = enabled
+        self.username_format_switcher.configure(
+            state="normal" if enabled else "disabled"
+        )
+
+    def _on_username_format_change(self, value):
+        self.app.read_username_with_at = value == "Com @"
+
+    def _on_antiflood_change(self):
+        self.app.anti_flood_enabled = self.antiflood_var.get()
+
+    def _on_events_change(self):
+        self.app.announce_events_enabled = self.events_var.get()
+
+    # -- OK / Cancelar --------------------------------------------------------
+    def _on_ok(self):
+        chosen_mode = "dark" if self.appearance_var.get() == "Escuro" else "light"
+        self.app.settings_window = None
+        self.destroy()
+        # O tema só é aplicado (e tudo salvo) depois desta janela já ter
+        # sido destruída, com um pequeno atraso para garantir que o Tkinter
+        # processou o fechamento antes do redesenho global do tema.
+        self.app.after(50, lambda: self.app.apply_appearance_mode_and_save(chosen_mode))
+
+    def _on_cancel(self):
+        snap = self._snapshot
+        self.app.language_var.set(snap["language"])
+        self.app.voice_var.set(snap["voice"])
+        self.app.volume_value = snap["volume"]
+        self.app.read_username_enabled = snap["read_username_enabled"]
+        self.app.read_username_with_at = snap["read_username_with_at"]
+        self.app.anti_flood_enabled = snap["anti_flood_enabled"]
+        self.app.announce_events_enabled = snap["announce_events_enabled"]
+
         self.app.settings_window = None
         self.destroy()
 
-    def _on_appearance_change(self, value):
-        try:
-            ctk.set_appearance_mode("dark" if value == "Escuro" else "light")
-        except Exception as e:
-            self.app.log(f"⚠️ Erro ao trocar tema: {e}")
-
+    # -- Prévia de voz ---------------------------------------------------------
     def _preview_voice(self):
         if self.app.running:
             self.app.log(
@@ -240,9 +564,18 @@ class TikTokTTSApp(ctk.CTk):
     def __init__(self):
         super().__init__()
 
+        # Carrega configurações salvas (se existirem) antes de montar a UI,
+        # para já abrir com as últimas escolhas do usuário.
+        saved_config = self._load_config()
+
+        saved_appearance = saved_config.get("appearance_mode")
+        if saved_appearance in ("Dark", "Light"):
+            ctk.set_appearance_mode(saved_appearance.lower())
+
         self.title(f"{APP_NAME} v{APP_VERSION} • TikTok Live TTS")
         self.geometry(WINDOW_SIZE)
-        self.resizable(False, False)
+        self.minsize(*WINDOW_MIN_SIZE)
+        self.resizable(True, True)
 
         # --- Estado interno -------------------------------------------------
         self.log_queue: "queue.Queue[str]" = queue.Queue()
@@ -250,10 +583,30 @@ class TikTokTTSApp(ctk.CTk):
         self.loop: asyncio.AbstractEventLoop | None = None
         self.client: TikTokLiveClient | None = None
         self.running = False
+        # True quando o próprio usuário pediu para parar — usado para não
+        # tentar reconectar automaticamente nesse caso.
+        self.manual_stop = False
         self.log_visible = True
-        self.volume_value = 80.0
-        self.voice_var = ctk.StringVar(value=list(VOICES.keys())[0])
+
+        self.volume_value = float(saved_config.get("volume", 80.0))
+
+        saved_language = saved_config.get("language")
+        default_language = saved_language if saved_language in LANGUAGES else DEFAULT_LANGUAGE
+        self.language_var = ctk.StringVar(value=default_language)
+
+        voices_for_language = list(LANGUAGES[default_language].keys())
+        saved_voice = saved_config.get("voice")
+        default_voice = saved_voice if saved_voice in voices_for_language else voices_for_language[0]
+        self.voice_var = ctk.StringVar(value=default_voice)
+
+        self.read_username_enabled = bool(saved_config.get("read_username_enabled", True))
+        self.read_username_with_at = bool(saved_config.get("read_username_with_at", True))
+        self.anti_flood_enabled = bool(saved_config.get("anti_flood_enabled", True))
+        self.announce_events_enabled = bool(saved_config.get("announce_events_enabled", True))
         self.settings_window: SettingsWindow | None = None
+
+        self._saved_username = saved_config.get("username", "controlee2")
+        self._current_avatar_image = None  # mantém referência viva (evita GC)
 
         # Evita que o bot e uma prévia de voz usem o mixer do pygame ao mesmo
         # tempo (pygame.mixer.music só toca uma faixa por vez).
@@ -269,6 +622,54 @@ class TikTokTTSApp(ctk.CTk):
 
         # Começa a "escutar" a fila de logs vinda da thread de trabalho
         self.after(100, self._poll_log_queue)
+
+    # =========================================================================
+    # Configurações persistentes (config.json)
+    # =========================================================================
+    def _load_config(self) -> dict:
+        if not os.path.exists(CONFIG_PATH):
+            return {}
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+
+    def save_config(self):
+        config = {
+            "username": (
+                self.username_entry.get().strip()
+                if hasattr(self, "username_entry")
+                else self._saved_username
+            ),
+            "language": self.language_var.get(),
+            "voice": self.voice_var.get(),
+            "volume": self.volume_value,
+            "appearance_mode": ctk.get_appearance_mode(),
+            "read_username_enabled": self.read_username_enabled,
+            "read_username_with_at": self.read_username_with_at,
+            "anti_flood_enabled": self.anti_flood_enabled,
+            "announce_events_enabled": self.announce_events_enabled,
+        }
+        try:
+            with open(CONFIG_PATH, "w", encoding="utf-8") as f:
+                json.dump(config, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            self.log(f"⚠️ Não foi possível salvar as configurações: {e}")
+
+    def apply_appearance_mode_and_save(self, mode: str):
+        """Aplica o tema (chamado só depois que a janela de Configurações já
+        foi destruída, para evitar o bug do CustomTkinter que fechava a
+        própria janela de Configurações ao trocar de tema com ela aberta)."""
+        try:
+            ctk.set_appearance_mode(mode)
+        except Exception as e:
+            self.log(f"⚠️ Erro ao trocar tema: {e}")
+        self.save_config()
+
+    def get_current_voice_id(self) -> str:
+        lang_voices = LANGUAGES.get(self.language_var.get(), {})
+        return lang_voices.get(self.voice_var.get(), "pt-BR-AntonioNeural")
 
     # =========================================================================
     # Construção da interface
@@ -303,13 +704,47 @@ class TikTokTTSApp(ctk.CTk):
         self.username_entry = ctk.CTkEntry(
             user_frame, placeholder_text="Ex: controlee2"
         )
-        self.username_entry.insert(0, "controlee2")
+        self.username_entry.insert(0, self._saved_username)
         self.username_entry.pack(fill="x", padx=16, pady=(0, 14))
 
-        # ---------- Botão Play grande + status ----------
+        # ---------- Cartão de perfil (foto + nome + status) ----------
         center_frame = ctk.CTkFrame(self, fg_color="transparent")
         center_frame.pack(fill="both", expand=True)
 
+        profile_card = ctk.CTkFrame(center_frame, corner_radius=16)
+        profile_card.pack(fill="x", padx=pad, pady=(24, 20))
+        profile_card.grid_columnconfigure(1, weight=1)
+
+        self.avatar_label = ctk.CTkLabel(
+            profile_card,
+            text="👤",
+            width=AVATAR_SIZE,
+            height=AVATAR_SIZE,
+            corner_radius=AVATAR_SIZE // 2,
+            fg_color=("gray80", "gray25"),
+            font=ctk.CTkFont(size=24),
+        )
+        self.avatar_label.grid(row=0, column=0, rowspan=2, padx=16, pady=16)
+
+        self.profile_name_label = ctk.CTkLabel(
+            profile_card,
+            text="Nenhuma conexão ativa",
+            font=ctk.CTkFont(size=15, weight="bold"),
+            anchor="w",
+            justify="left",
+        )
+        self.profile_name_label.grid(row=0, column=1, sticky="ew", padx=(0, 16), pady=(16, 0))
+
+        self.status_label = ctk.CTkLabel(
+            profile_card,
+            text="● Parado",
+            text_color="gray60",
+            font=ctk.CTkFont(size=13),
+            anchor="w",
+        )
+        self.status_label.grid(row=1, column=1, sticky="ew", padx=(0, 16), pady=(0, 16))
+
+        # ---------- Botão Play grande ----------
         self.play_button = ctk.CTkButton(
             center_frame,
             text="▶   Iniciar",
@@ -321,15 +756,7 @@ class TikTokTTSApp(ctk.CTk):
             hover_color="#248a5d",
             command=self.toggle_bot,
         )
-        self.play_button.pack(pady=(32, 16))
-
-        self.status_label = ctk.CTkLabel(
-            center_frame,
-            text="● Parado",
-            text_color="gray60",
-            font=ctk.CTkFont(size=15, weight="bold"),
-        )
-        self.status_label.pack()
+        self.play_button.pack(pady=(0, 16))
 
         # ---------- Botão mostrar/ocultar log ----------
         self.toggle_log_button = ctk.CTkButton(
@@ -415,6 +842,29 @@ class TikTokTTSApp(ctk.CTk):
             )
             self.username_entry.configure(state="normal")
             self.status_label.configure(text="● Parado", text_color="gray60")
+            self._reset_profile_display()
+
+    def _reset_profile_display(self):
+        self._current_avatar_image = None
+        self.avatar_label.configure(image=None, text="👤")
+        self.profile_name_label.configure(text="Nenhuma conexão ativa")
+
+    def _set_profile_photo(self, photo):
+        self._current_avatar_image = photo  # mantém referência viva
+        self.avatar_label.configure(image=photo, text="")
+
+    def _bytes_to_circular_ctk_image(self, image_bytes: bytes, size: int = AVATAR_SIZE):
+        try:
+            from PIL import Image, ImageDraw
+
+            img = Image.open(io.BytesIO(image_bytes)).convert("RGBA").resize((size, size))
+            mask = Image.new("L", (size, size), 0)
+            ImageDraw.Draw(mask).ellipse((0, 0, size, size), fill=255)
+            img.putalpha(mask)
+            return ctk.CTkImage(light_image=img, dark_image=img, size=(size, size))
+        except Exception as e:
+            self.log(f"ℹ️ Não foi possível processar a foto de perfil: {e}")
+            return None
 
     # =========================================================================
     # Controle do bot (chamado pelo thread principal / botão play)
@@ -434,8 +884,11 @@ class TikTokTTSApp(ctk.CTk):
             self.log("⚠️ Informe um usuário do TikTok válido.")
             return
 
+        self.manual_stop = False
+        self._reset_profile_display()
         self._set_running_state(True)
         self.log(f"Iniciando conexão com @{username.lstrip('@')}...")
+        self.save_config()
 
         self.worker_thread = threading.Thread(
             target=self._thread_main, args=(username,), daemon=True
@@ -446,6 +899,7 @@ class TikTokTTSApp(ctk.CTk):
         if not self.running:
             return
 
+        self.manual_stop = True
         self.log("Encerrando conexão, aguarde...")
         self.play_button.configure(state="disabled")
 
@@ -458,6 +912,7 @@ class TikTokTTSApp(ctk.CTk):
 
     def _on_close(self):
         """Fechamento seguro da janela."""
+        self.save_config()
         if self.running:
             self.stop_bot()
             # Dá um tempo curto para a thread encerrar de forma limpa
@@ -540,70 +995,179 @@ class TikTokTTSApp(ctk.CTk):
         tiktok_username = username if username.startswith("@") else f"@{username}"
 
         self.tts_queue: "asyncio.Queue" = asyncio.Queue()
-
-        try:
-            self.client = TikTokLiveClient(unique_id=tiktok_username)
-        except Exception as e:
-            self.log(f"❌ Não foi possível criar o cliente ({type(e).__name__}): {e}")
-            self.log("Detalhes técnicos:\n" + traceback.format_exc())
-            return
-
-        @self.client.on(ConnectEvent)
-        async def on_connect(event: ConnectEvent):
-            self.log(f"✅ Conectado à live de {tiktok_username}!")
-            self.after(0, lambda: self.status_label.configure(
-                text="● Conectado", text_color="#2fa572"
-            ))
-
-        @self.client.on(DisconnectEvent)
-        async def on_disconnect(event: DisconnectEvent):
-            self.log("🔌 Desconectado da live.")
-
-        @self.client.on(CommentEvent)
-        async def on_comment(event: CommentEvent):
-            try:
-                user = event.user.nickname or event.user.unique_id
-            except Exception:
-                user = "Usuário"
-            text = getattr(event, "comment", "") or ""
-
-            if not text.strip():
-                return
-
-            self.log(f"[{user}]: {text}")
-            await self.tts_queue.put((user, text))
+        self._recent_spoken = collections.deque(maxlen=50)
 
         tts_task = asyncio.create_task(self._tts_worker())
 
+        attempt = 0
+
+        def register_events(client: TikTokLiveClient):
+            @client.on(ConnectEvent)
+            async def on_connect(event: ConnectEvent):
+                nonlocal attempt
+                attempt = 0  # reseta o contador após uma conexão bem-sucedida
+                self.log(f"✅ Conectado à live de {tiktok_username}!")
+                self.after(0, lambda: self.status_label.configure(
+                    text="● Conectado", text_color="#2fa572"
+                ))
+
+                try:
+                    nickname = getattr(event.user, "nickname", None)
+                    handle = getattr(event.user, "unique_id", None) or tiktok_username.lstrip("@")
+                    if nickname and nickname.lower() != handle.lower():
+                        display_name = f"{nickname} (@{handle})"
+                    else:
+                        display_name = f"@{handle}"
+                    self.after(0, lambda: self.profile_name_label.configure(text=display_name))
+                except Exception:
+                    pass
+
+                try:
+                    avatar = getattr(event.user, "avatar_thumb", None)
+                    if avatar is not None:
+                        image_bytes = await client.web.fetch_image_data(image=avatar)
+                        photo = self._bytes_to_circular_ctk_image(image_bytes)
+                        if photo is not None:
+                            self.after(0, lambda p=photo: self._set_profile_photo(p))
+                except Exception as e:
+                    self.log(f"ℹ️ Não foi possível carregar a foto de perfil: {e}")
+
+            @client.on(DisconnectEvent)
+            async def on_disconnect(event: DisconnectEvent):
+                self.log("🔌 Desconectado da live.")
+
+            @client.on(CommentEvent)
+            async def on_comment(event: CommentEvent):
+                try:
+                    user = event.user.nickname or event.user.unique_id
+                except Exception:
+                    user = "Usuário"
+                text = getattr(event, "comment", "") or ""
+
+                if not text.strip():
+                    return
+
+                self.log(f"[{user}]: {text}")
+
+                if self.read_username_enabled:
+                    phrases = PHRASES.get(self.language_var.get(), PHRASES[DEFAULT_LANGUAGE])
+                    prefix = "@" if self.read_username_with_at else ""
+                    spoken_text = phrases["said"].format(user=f"{prefix}{user}", text=text)
+                else:
+                    spoken_text = text
+                await self._enqueue_spoken(spoken_text)
+
+            if self.announce_events_enabled and GiftEvent is not None:
+                @client.on(GiftEvent)
+                async def on_gift(event):
+                    try:
+                        user = event.user.nickname or event.user.unique_id
+                    except Exception:
+                        user = "Usuário"
+                    try:
+                        gift_name = event.gift.name
+                    except Exception:
+                        gift_name = "um presente"
+                    # Presentes "combo" disparam vários eventos seguidos —
+                    # só anuncia quando o combo termina, pra não repetir.
+                    try:
+                        is_streakable = getattr(event.gift, "streakable", False)
+                        combo_ended = getattr(event, "repeat_end", True)
+                        if is_streakable and not combo_ended:
+                            return
+                    except Exception:
+                        pass
+                    self.log(f"🎁 {user} enviou: {gift_name}")
+                    phrases = PHRASES.get(self.language_var.get(), PHRASES[DEFAULT_LANGUAGE])
+                    await self._enqueue_spoken(phrases["gift"].format(user=user, gift=gift_name))
+
+            if self.announce_events_enabled and FollowEvent is not None:
+                @client.on(FollowEvent)
+                async def on_follow(event):
+                    try:
+                        user = event.user.nickname or event.user.unique_id
+                    except Exception:
+                        user = "Usuário"
+                    self.log(f"➕ {user} começou a seguir!")
+                    phrases = PHRASES.get(self.language_var.get(), PHRASES[DEFAULT_LANGUAGE])
+                    await self._enqueue_spoken(phrases["follow"].format(user=user))
+
         try:
-            # IMPORTANTE: start() NÃO bloqueia — ele apenas dispara a conexão
-            # em uma Task e retorna imediatamente. connect() é o método
-            # correto aqui, pois ele aguarda (bloqueia) até a live encerrar
-            # ou a conexão cair, o que é o comportamento que queremos numa
-            # thread dedicada.
-            await self.client.connect()
-            self.log("ℹ️ A conexão com a live foi encerrada.")
-        except UserOfflineError:
-            self.log(
-                f"⚠️ @{tiktok_username.lstrip('@')} está offline no momento "
-                f"(a pessoa não está fazendo live agora)."
-            )
-        except UserNotFoundError:
-            self.log(
-                f"⚠️ Usuário @{tiktok_username.lstrip('@')} não foi encontrado. "
-                f"Verifique se o nome de usuário está correto."
-            )
-        except AlreadyConnectedError:
-            self.log("⚠️ Já existe uma conexão ativa com essa live.")
-        except SignAPIError as e:
-            self.log(
-                f"⚠️ Erro no servidor de assinatura (Sign API) da TikTokLive: {e}\n"
-                f"Isso geralmente significa limite de requisições atingido (rate limit). "
-                f"Aguarde alguns minutos antes de tentar novamente."
-            )
-        except Exception as e:
-            self.log(f"❌ Falha na conexão ({type(e).__name__}): {e}")
-            self.log("Detalhes técnicos:\n" + traceback.format_exc())
+            while True:
+                if self.manual_stop:
+                    break
+
+                try:
+                    self.client = TikTokLiveClient(unique_id=tiktok_username)
+                except Exception as e:
+                    self.log(f"❌ Não foi possível criar o cliente ({type(e).__name__}): {e}")
+                    self.log("Detalhes técnicos:\n" + traceback.format_exc())
+                    break
+
+                register_events(self.client)
+
+                should_retry = False
+
+                try:
+                    # IMPORTANTE: start() NÃO bloqueia — ele apenas dispara a
+                    # conexão em uma Task e retorna imediatamente. connect()
+                    # é o método correto aqui, pois ele aguarda (bloqueia)
+                    # até a live encerrar ou a conexão cair.
+                    await self.client.connect()
+                    self.log("ℹ️ A conexão com a live foi encerrada.")
+                    should_retry = True  # queda inesperada -> vale tentar de novo
+                except UserOfflineError:
+                    self.log(
+                        f"⚠️ @{tiktok_username.lstrip('@')} está offline no momento "
+                        f"(a pessoa não está fazendo live agora)."
+                    )
+                    should_retry = False
+                except UserNotFoundError:
+                    self.log(
+                        f"⚠️ Usuário @{tiktok_username.lstrip('@')} não foi encontrado. "
+                        f"Verifique se o nome de usuário está correto."
+                    )
+                    should_retry = False
+                except AlreadyConnectedError:
+                    self.log("⚠️ Já existe uma conexão ativa com essa live.")
+                    should_retry = True
+                except SignAPIError as e:
+                    self.log(
+                        f"⚠️ Erro no servidor de assinatura (Sign API) da TikTokLive: {e}\n"
+                        f"Isso geralmente significa limite de requisições atingido (rate limit)."
+                    )
+                    should_retry = True
+                except Exception as e:
+                    self.log(f"❌ Falha na conexão ({type(e).__name__}): {e}")
+                    self.log("Detalhes técnicos:\n" + traceback.format_exc())
+                    should_retry = True
+
+                if self.manual_stop or not should_retry:
+                    break
+
+                attempt += 1
+                if attempt > MAX_RECONNECT_ATTEMPTS:
+                    self.log(
+                        f"❌ Número máximo de tentativas de reconexão "
+                        f"({MAX_RECONNECT_ATTEMPTS}) atingido. Desistindo."
+                    )
+                    break
+
+                delay = RECONNECT_BASE_DELAY_SECONDS * attempt
+                self.log(
+                    f"🔄 Tentando reconectar em {delay}s "
+                    f"(tentativa {attempt}/{MAX_RECONNECT_ATTEMPTS})..."
+                )
+                self.after(0, lambda: self.status_label.configure(
+                    text="● Reconectando...", text_color="#f1c40f"
+                ))
+
+                # Espera em passos de 1s para responder rápido a um "Parar"
+                # clicado pelo usuário durante a contagem regressiva.
+                for _ in range(delay):
+                    if self.manual_stop:
+                        break
+                    await asyncio.sleep(1)
         finally:
             tts_task.cancel()
             try:
@@ -626,28 +1190,52 @@ class TikTokTTSApp(ctk.CTk):
         except Exception:
             pass
 
+    async def _enqueue_spoken(self, spoken_text: str):
+        """Adiciona um texto à fila de fala, aplicando o filtro anti-flood
+        (mensagens repetidas recentemente) e o limite de tamanho da fila."""
+        if self.anti_flood_enabled:
+            now = time.monotonic()
+            normalized = spoken_text.strip().lower()
+
+            while self._recent_spoken and now - self._recent_spoken[0][0] > RECENT_MESSAGE_WINDOW_SECONDS:
+                self._recent_spoken.popleft()
+
+            if any(t == normalized for _, t in self._recent_spoken):
+                return  # mensagem repetida recentemente -> ignora
+
+            self._recent_spoken.append((now, normalized))
+
+        # Evita que a fila cresça demais num chat muito ativo: descarta as
+        # mensagens mais antigas para priorizar as mais recentes.
+        while self.tts_queue.qsize() >= MAX_QUEUE_SIZE:
+            try:
+                self.tts_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+        await self.tts_queue.put(spoken_text)
+
     async def _tts_worker(self):
-        """Consome a fila de comentários e lê cada um em voz alta, um por vez."""
+        """Consome a fila de textos e lê cada um em voz alta, um por vez."""
         while True:
             try:
-                user, text = await self.tts_queue.get()
+                spoken_text = await self.tts_queue.get()
             except asyncio.CancelledError:
                 break
 
             try:
-                await self._speak(text)
+                await self._speak(spoken_text)
             except Exception as e:
                 self.log(f"⚠️ Erro ao gerar/reproduzir áudio ({type(e).__name__}): {e}")
                 self.log("Detalhes técnicos:\n" + traceback.format_exc())
 
-    async def _speak(self, text: str):
-        voice_label = self.voice_var.get()
-        voice_id = VOICES.get(voice_label, "pt-BR-AntonioNeural")
+    async def _speak(self, spoken_text: str):
+        voice_id = self.get_current_voice_id()
 
         filename = os.path.join(self.temp_dir, f"tts_{uuid.uuid4().hex}.mp3")
 
         # Gera o áudio com edge-tts
-        communicate = edge_tts.Communicate(text, voice_id)
+        communicate = edge_tts.Communicate(spoken_text, voice_id)
         await communicate.save(filename)
 
         # Reproduz com pygame, sem travar o event loop. O lock evita conflito
@@ -687,12 +1275,12 @@ class TikTokTTSApp(ctk.CTk):
             callback(error_message)
 
     async def _generate_and_play_preview(self):
-        voice_label = self.voice_var.get()
-        voice_id = VOICES.get(voice_label, "pt-BR-AntonioNeural")
+        voice_id = self.get_current_voice_id()
+        preview_text = PREVIEW_TEXTS.get(self.language_var.get(), PREVIEW_TEXTS[DEFAULT_LANGUAGE])
 
         filename = os.path.join(self.temp_dir, f"preview_{uuid.uuid4().hex}.mp3")
 
-        communicate = edge_tts.Communicate(PREVIEW_TEXT, voice_id)
+        communicate = edge_tts.Communicate(preview_text, voice_id)
         await communicate.save(filename)
 
         # Se o bot não estiver rodando, o mixer ainda não foi inicializado —
